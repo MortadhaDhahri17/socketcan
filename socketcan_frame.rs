@@ -33,9 +33,9 @@
 
 
 /// Different imports : 
-
 use crate::socketcan_id::*; 
 use crate::socketcan_embedded::*; 
+use crate::socketcan_error::*; 
 
 /// Constants To be rechecked with libc
 pub const _CANFD_BRS: u32 = 1;
@@ -286,3 +286,208 @@ impl From<canfd_frame> for CanRawFrame {
     }
 }
 
+// ===== CanErrorFrame =====
+
+/// A SocketCAN error frame.
+///
+/// This is returned from a read/receive by the OS or interface device
+/// driver when it detects an error, such as a problem on the bus. The
+/// frame encodes detailed information about the error, which can be
+/// managed directly by the application or converted into a Rust error
+///
+/// This is highly compatible with the `can_frame` from libc.
+/// ([ref](https://docs.rs/libc/latest/libc/struct.can_frame.html))
+pub struct CanErrorFrame(can_frame);
+
+impl CanErrorFrame {
+    /// Creates a CAN error frame from raw parts.
+    ///
+    /// Note that an application would not normally _ever_ create an error
+    /// frame. This is included mainly to aid in implementing mocks and other
+    /// tests for an application.
+    ///
+    /// The data byte slice should have the necessary codes for the supplied
+    /// error. They will be zero padded to a full frame of 8 bytes.
+    ///
+    /// Also note:
+    /// - The error flag is forced on
+    /// - The other, non-error, flags are forced off
+    /// - The frame data is always padded with zero's to 8 bytes,
+    /// regardless of the length of the `data` parameter provided.
+    pub fn new_error(can_id: canid_t, data: &[u8]) -> Result<Self, ConstructionError> {
+        match data.len() {
+            n if n <= _CAN_MAX_DLEN as usize => {
+                let mut frame = can_frame_default();
+                frame.can_id = (can_id & _CAN_ERR_MASK) | _CAN_ERR_FLAG;
+                frame.can_dlc = _CAN_MAX_DLEN as u8;
+                frame.data[..n].copy_from_slice(data);
+                Ok(Self(frame))
+            }
+            _ => Err(ConstructionError::TooMuchData),
+        }
+    }
+
+    /// Return the error bits from the ID word of the error frame.
+    pub fn error_bits(&self) -> u32 {
+        self.id_word() & _CAN_ERR_MASK
+    }
+
+    /// Converts this error frame into a `CanError`
+    pub fn into_error(self) -> CanError {
+        CanError::from(self)
+    }
+}
+
+impl AsPtr for CanErrorFrame {
+    type Inner = can_frame;
+
+    /// Gets a pointer to the CAN frame structure that is compatible with
+    /// the Linux C API.
+    fn as_ptr(&self) -> *const Self::Inner {
+        &self.0
+    }
+
+    /// Gets a mutable pointer to the CAN frame structure that is compatible
+    /// with the Linux C API.
+    fn as_mut_ptr(&mut self) -> *mut Self::Inner {
+        &mut self.0
+    }
+}
+
+impl crate::socketcan_embedded::Frame for CanErrorFrame {
+    /// Create an error frame.
+    ///
+    /// Note that an application would not normally _ever_ create an error
+    /// frame. This is included mainly to aid in implementing mocks and other
+    /// tests for an application.
+    ///
+    /// This will set the error bit in the CAN ID word.
+    fn new(id: impl Into<Id>, data: &[u8]) -> Option<Self> {
+        let can_id = id_to_canid_t(id);
+        Self::new_error(can_id, data).ok()
+    }
+    ///doc for something
+    fn id(&self) -> Id {
+        todo!() ; 
+    }
+    /// The application should not create an error frame.
+    /// This will always return None.
+    fn new_remote(_id: impl Into<Id>, _dlc: usize) -> Option<Self> {
+        None
+    }
+
+    /// Check if frame uses 29-bit extended ID format.
+    fn is_extended(&self) -> bool {
+        self.is_extended() 
+    }
+
+    /// Check if frame is a remote transmission request.
+    fn is_remote_frame(&self) -> bool {
+        false
+    }
+
+    /// Check if frame is a data frame.
+    fn is_data_frame(&self) -> bool {
+        false
+    }
+
+    /// Data length code
+    fn dlc(&self) -> usize {
+        self.0.can_dlc as usize
+    }
+
+    /// A slice into the actual data.
+    /// An error frame can always acess the full 8-byte data payload.
+    fn data(&self) -> &[u8] {
+        &self.0.data[..]
+    }
+}
+
+impl CanErrorFrame {
+    /// Get the composite SocketCAN ID word, with EFF/RTR/ERR flags
+    fn id_word(&self) -> canid_t {
+        self.0.can_id
+    }
+
+    /// Sets the CAN ID for the frame
+    /// This does nothing on an error frame.
+    fn set_id(&mut self, _id: impl Into<Id>) {}
+
+    /// Sets the data payload of the frame.
+    /// This is an error on an error frame.
+    fn set_data(&mut self, _data: &[u8]) -> Result<(), ConstructionError> {
+        Err(ConstructionError::WrongFrameType)
+    }
+    fn data(&self) -> &[u8] {
+        &self.0.data[..]
+    }
+}
+/* 
+impl core::fmt::Debug for CanErrorFrame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "CanErrorFrame {{ ")?;
+        core::fmt::UpperHex::fmt(self, f)?;
+        write!(f, " }}")
+    }
+}*/
+/* 
+impl core::fmt::UpperHex for CanErrorFrame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
+        write!(f, "{:X}#", self.0.can_id)?;
+        let mut parts = self.data().iter().map(|v| alloc::format!("{:02X}", v));
+        write!(f, "{}", parts.join(" "))
+    }
+}
+*/
+impl TryFrom<can_frame> for CanErrorFrame {
+    type Error = ConstructionError;
+
+    /// Try to create a `CanErrorFrame` from a C `can_frame`
+    ///
+    /// This will only succeed the C frame is marked as an error frame.
+    fn try_from(frame: can_frame) -> Result<Self, Self::Error> {
+        if frame.can_id & _CAN_ERR_FLAG != 0 {
+            Ok(Self(frame))
+        } else {
+            Err(ConstructionError::WrongFrameType)
+        }
+    }
+}
+
+impl From<CanError> for CanErrorFrame {
+    fn from(err: CanError) -> Self {
+        use CanError::*;
+
+        let mut data = [0u8; _CAN_MAX_DLEN as usize ];
+        let id: canid_t = match err {
+            TransmitTimeout => 0x0001,
+            LostArbitration(bit) => {
+                data[0] = bit;
+                0x0002
+            }
+            ControllerProblem(prob) => {
+                data[1] = prob as u8;
+                0x0004
+            }
+            ProtocolViolation { vtype, location } => {
+                data[2] = vtype as u8;
+                data[3] = location as u8;
+                0x0008
+            }
+            TransceiverError => 0x0010,
+            NoAck => 0x0020,
+            BusOff => 0x0040,
+            BusError => 0x0080,
+            Restarted => 0x0100,
+            DecodingFailure(_failure) => 0,
+            Unknown(e) => e,
+        };
+        Self::new_error(id, &data).unwrap()
+    }
+}
+
+impl AsRef<can_frame> for CanErrorFrame {
+    fn as_ref(&self) -> &can_frame {
+        &self.0
+    }
+}
